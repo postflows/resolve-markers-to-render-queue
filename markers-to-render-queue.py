@@ -16,6 +16,8 @@ Key features:
 - Filter markers by color or process all
 - Single markers: render entire clip at marker
 - Duration markers: render only the marker's frame range (with validation)
+- Single → Next Marker: render range from marker to the next marker (any color/type), last marker to timeline end
+- Single → Next Same Color: render range from marker to the next marker with the same selected color, last marker to timeline end
 - Naming: components (ProjectName, TimelineName, MarkerName, etc.), shotID (auto/reel/source), task, version
 - Save/load naming presets
 - Timeline and video track selection; markers table with double-click to jump to timecode
@@ -257,7 +259,9 @@ def main_ui():
         ui.VGroup({"Spacing": 5}, [
             ui.HGroup({"Spacing": 5}, [
                 ui.Label({"Text": "Timeline:", "Weight": 0}),
-                ui.ComboBox({"ID": "tl_preset", "Weight": 1}),
+                # Read-only: this tool always works with the timeline that was
+                # active in Resolve when it was launched (see "timeline" global).
+                ui.Label({"ID": "tl_preset_label", "Text": "", "StyleSheet": "font-weight: bold;", "Weight": 1}),
                 ui.Label({"Text": "Marker Color:", "Weight": 0}),
                 ui.ComboBox({"ID": "marker_color", "Weight": 2})
             ]),
@@ -267,7 +271,7 @@ def main_ui():
             ]),
             ui.HGroup({"Spacing": 5}, [
                 ui.Label({"Text": "Marker Type:", "Weight": 0}),
-                ui.ComboBox({"ID": "marker_type", "Items": ["Single", "Duration"], "CurrentText": "Single"})
+                ui.ComboBox({"ID": "marker_type", "Items": ["Single", "Duration", "Single → Next Marker", "Single → Next Same Color"], "CurrentText": "Single"})
             ])
          
         ]),
@@ -275,17 +279,22 @@ def main_ui():
         # Markers Table
         ui.Tree({
             "ID": "markers_table",
-            "HeaderText": "Timecode|Color|Name|Source Name|Clip Name|Note|Reel Name",
-            "ColumnCount": 7,
-            "ColumnWidth": "180,160,120,200,200,150,100",
+            "HeaderText": " |Timecode|Color|Name|Source Name|Clip Name|Note|Reel Name",
+            "ColumnCount": 8,
+            "ColumnWidth": "26,170,110,150,190,190,140,100",
             "SelectionMode": "MultiSelection",
             "Weight": 15,
             "AlternatingRowColors": True,
-            "InitialSortColumn": 0,
+            "InitialSortColumn": 1,
             "InitialSortOrder": "AscendingOrder",
             "SortingEnabled": True,
-            "Events": {"ItemDoubleClicked": True}
+            "Events": {"ItemDoubleClicked": True, "ItemChanged": True}
         }),
+        ui.HGroup({"Spacing": 5}, [
+            ui.Label({"Text": "Tip: check a box to include only those markers when rendering. Double-click Color/Name/Note to edit.", "StyleSheet": "color: #999999; font-size: 11px;", "Weight": 3}),
+            ui.Button({"ID": "delete_markers_btn", "Text": "Delete Checked", "Weight": 1}),
+            ui.Button({"ID": "clear_selection_btn", "Text": "Clear Checks", "Weight": 1})
+        ]),
 
         # Render Settings
         ui.VGroup({"Spacing": 5}, [
@@ -471,7 +480,7 @@ def main_ui():
                     "ID": "create_folders", 
                     "Text":  "📁 Create separate folder for each render (based on filename)",
                     "StyleSheet": "font-size: 13px;",
-                    "Checked": True,
+                    "Checked": False,
                     "ToolTip": "Creates a subfolder for each render job with the same name as the output file. Essential for EXR sequences."
                 })
             ]),
@@ -494,11 +503,101 @@ def main_ui():
         })
     ])
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+
 def sanitize_filename(s):
     """
-    Replaces invalid filename characters with underscore.
+    Replaces invalid filename characters with underscore, strips trailing
+    dots/spaces, and avoids Windows-reserved device names (CON, PRN, NUL,
+    COM1-9, LPT1-9) — needed if renders end up on storage that's also read
+    from Windows machines, since these can otherwise produce a name that's
+    invalid or behaves oddly on that OS.
     """
-    return re.sub(r'[<>:"/\\|?*]', '_', s) if isinstance(s, str) else s
+    if not isinstance(s, str):
+        return s
+    result = re.sub(r'[<>:"/\\|?*]', '_', s)
+    result = result.rstrip('. ')
+    if result.upper() in _WINDOWS_RESERVED_NAMES:
+        result = f"{result}_"
+    return result
+
+def _format_fps_value(fps_value):
+    """
+    Formats FPS value for filenames (e.g. 24, 23.976).
+    """
+    try:
+        fps_float = float(fps_value)
+        if fps_float.is_integer():
+            return str(int(fps_float))
+        s = f"{fps_float:.3f}"
+        return s.rstrip('0').rstrip('.')
+    except Exception:
+        return str(fps_value) if fps_value is not None else ""
+
+_render_preset_format_codec_cache = {}
+
+
+def _get_render_preset_format_codec(proj, preset_name):
+    """
+    Returns (format, codec) for the given render preset name.
+    The values are read after loading the preset into the project.
+
+    Cached per preset name for the life of the script: this gets called once
+    per naming component per marker, and reloading the same preset from disk
+    every time is wasted work (this tool already loads the selected preset
+    once up front in _main() before any of this runs).
+    """
+    if preset_name in _render_preset_format_codec_cache:
+        return _render_preset_format_codec_cache[preset_name]
+
+    try:
+        if preset_name:
+            proj.LoadRenderPreset(preset_name)
+        info = proj.GetCurrentRenderFormatAndCodec() or {}
+        fmt = info.get("format", "") or ""
+        codec = info.get("codec", "") or ""
+
+        # Fallback: some presets (e.g. certain H.265 variants) may not populate "codec" here.
+        if not codec:
+            try:
+                settings = proj.GetRenderSettings() or {}
+                for key in (
+                    "Codec", "codec",
+                    "VideoCodec", "videoCodec",
+                    "VideoCodecName", "videoCodecName",
+                    "OutputCodec", "outputCodec",
+                ):
+                    value = settings.get(key)
+                    if isinstance(value, str) and value.strip():
+                        codec = value.strip()
+                        break
+            except Exception as e:
+                debug_print(f"RenderSettings codec fallback failed: {str(e)}")
+
+        # Last-resort fallback: infer codec from preset name when API doesn't expose it.
+        # (Some Resolve builds return codec="" for H.265 presets in GetCurrentRenderFormatAndCodec.)
+        if not codec and preset_name:
+            name = str(preset_name).lower()
+            if "h.265" in name or "h265" in name or "hevc" in name:
+                codec = "H265"
+            elif "h.264" in name or "h264" in name or "avc" in name:
+                codec = "H264"
+
+        result = (fmt, codec)
+        _render_preset_format_codec_cache[preset_name] = result
+        return result
+    except Exception as e:
+        error_msg = f"Warning: failed to read render format/codec: {str(e)}"
+        update_status(error_msg)
+        print(error_msg)
+        result = ("", "")
+        _render_preset_format_codec_cache[preset_name] = result
+        return result
 
 def get_component_value(component_settings, clip_info, example_data, default_value, counter=0):
     """
@@ -523,6 +622,28 @@ def get_component_value(component_settings, clip_info, example_data, default_val
         return sanitize_filename(project.GetName() or default_value)
     elif source == "TimelineName":
         return sanitize_filename(timeline.GetName() or default_value)
+    elif source == "TimelineFPS":
+        fps = timeline.GetSetting("timelineFrameRate")
+        return sanitize_filename(_format_fps_value(fps) or default_value)
+    elif source == "TimelineResolution":
+        w = timeline.GetSetting("timelineResolutionWidth")
+        h = timeline.GetSetting("timelineResolutionHeight")
+        if w and h:
+            return sanitize_filename(f"{w}x{h}")
+        return sanitize_filename(default_value)
+    elif source == "RenderFormat":
+        preset_name = itm["render_preset"].CurrentText
+        fmt, _codec = _get_render_preset_format_codec(project, preset_name)
+        return sanitize_filename(fmt or default_value)
+    elif source == "RenderCodec":
+        preset_name = itm["render_preset"].CurrentText
+        _fmt, codec = _get_render_preset_format_codec(project, preset_name)
+        return sanitize_filename(codec or default_value)
+    elif source == "RenderFormatCodec":
+        preset_name = itm["render_preset"].CurrentText
+        fmt, codec = _get_render_preset_format_codec(project, preset_name)
+        value = "_".join([v for v in [fmt, codec] if v])
+        return sanitize_filename(value or default_value)
     elif source == "MarkerName":
         return sanitize_filename(example_data.get('marker_name', default_value))
     elif source == "MarkerNote":
@@ -567,17 +688,17 @@ def update_naming_preview():
             if table.TopLevelItemCount() > 0:
                 first_item = table.TopLevelItem(0)
                 example_data = {
-                    'timecode': first_item.Text[0],
-                    'source_name': first_item.Text[3],
-                    'clip_name': first_item.Text[4],
-                    'marker_name': first_item.Text[2],
-                    'marker_note': first_item.Text[5],
-                    'reel_name': first_item.Text[6]
+                    'timecode': first_item.Text[1],
+                    'source_name': first_item.Text[4],
+                    'clip_name': first_item.Text[5],
+                    'marker_name': first_item.Text[3],
+                    'marker_note': first_item.Text[6],
+                    'reel_name': first_item.Text[7]
                 }
 
                 # Get clip info at the marker frame
                 try:
-                    marker_frame = timeline.GetStartFrame() + int(first_item.Text[0].split(':')[-1])
+                    marker_frame = timeline.GetStartFrame() + int(first_item.Text[1].split(':')[-1])
                     clip_info = get_clip_at_marker(timeline, marker_frame)
                 except:
                     clip_info = None
@@ -641,7 +762,7 @@ window = disp.AddWindow({
     "WindowTitle": "Markers to Render Queue",
     "ID": "MTRWin", 
     'WindowFlags': {'Window': True, 'WindowStaysOnTopHint': True},
-    "Geometry": [1000, 400, 670, 770],
+    "Geometry": [1000, 400, 775, 800],
 }, main_ui())
 
 # Get UI items for global access
@@ -756,7 +877,9 @@ def get_markers(tl):
         color_markers.append(frame)
 
     if not color_markers:
-        print(f"ERROR: No {color} {marker_type} markers found")
+        no_markers_msg = f"No {color} {marker_type} markers found"
+        update_status(no_markers_msg)
+        print(f"ERROR: {no_markers_msg}")
 
     return sorted(color_markers), markers
 
@@ -771,6 +894,9 @@ def get_used_marker_colors(timeline):
     Returns:
         list: A list of colors with their counts in the format "Color (Count)".
     """
+    if not timeline:
+        return ["All (0)"]
+
     markers = timeline.GetMarkers()
     color_counts = {}
 
@@ -785,37 +911,13 @@ def get_used_marker_colors(timeline):
     return color_list
 
 
-def tl_idx(proj, tl_name):
+def get_session_timeline_name():
     """
-    Retrieves the index of a timeline by its name.
-
-    Args:
-        proj (Project): The project object containing the timelines.
-        tl_name (str): The name of the timeline to find.
-
-    Returns:
-        int: The index of the timeline, or None if not found.
+    Returns the name of the timeline this session is locked to (the one that
+    was active in Resolve when the script was launched — see the "timeline"
+    global), or None if there wasn't one.
     """
-    debug_print(f"Looking for timeline: {tl_name}")
-    for i in range(1, proj.GetTimelineCount() + 1):
-        if proj.GetTimelineByIndex(i).GetName() == tl_name:
-            debug_print(f"Found timeline at index: {i}")
-            return int(i)
-    return None
-
-
-def tl_lst(proj):
-    """
-    Retrieves the name of the current timeline.
-
-    Args:
-        proj (Project): The project object containing the timelines.
-
-    Returns:
-        str: The name of the current timeline, or None if no timeline is active.
-    """
-    current_timeline = proj.GetCurrentTimeline()
-    return current_timeline.GetName() if current_timeline else None
+    return timeline.GetName() if timeline else None
 
 def validate_frame_range(in_point, out_point, timeline):
     """
@@ -950,9 +1052,21 @@ def process_track_clips(track, track_index, marker_frame, track_type):
             }
     return None
 
-def get_clip_at_marker(timeline, marker_frame):
-
-    has_video, has_audio, video_tracks, audio_tracks = analyze_timeline_tracks(timeline, marker_frame)
+def get_clip_at_marker(timeline, marker_frame, has_video_audio=None):
+    """
+    Args:
+        has_video_audio: optional (has_video, has_audio) tuple, precomputed
+            once by the caller via analyze_timeline_tracks(), to avoid
+            rescanning every track on the timeline for every single marker
+            (analyze_timeline_tracks() doesn't actually use marker_frame —
+            it just checks whether the timeline has any video/audio clips
+            at all — so that result is the same for every marker and only
+            needs to be computed once per export/table refresh).
+    """
+    if has_video_audio is not None:
+        has_video, has_audio = has_video_audio
+    else:
+        has_video, has_audio, _video_tracks, _audio_tracks = analyze_timeline_tracks(timeline, marker_frame)
     
     if has_video:
         selected_track = itm["video_track"].CurrentText
@@ -1078,20 +1192,25 @@ def update_export_button_state():
     Otherwise, it is disabled.
     """
     export_path = itm["export_path"].CurrentText
-    itm["Export"].Enabled = bool(export_path and export_path.strip())
+    itm["Export"].Enabled = bool(export_path and export_path.strip()) and bool(timeline)
 
 
-def get_filenames(markers, all_markers):
+def get_filenames(markers, all_markers, counter_by_mark=None):
+    """
+    Args:
+        counter_by_mark: optional {frame: index} map used for Auto Number, so
+            numbering reflects each marker's position among ALL markers
+            matching the current filter rather than just this call's
+            (possibly checkbox-reduced) `markers` list. Falls back to
+            numbering within `markers` itself if not given.
+    """
     if itm["use_preset_naming"].Checked:
         return {}
         
     filename_map = {}
     
-    
-    render_preset_name = itm["render_preset"].CurrentText
-    project.LoadRenderPreset(render_preset_name)
-    
-    
+    # The render preset is already loaded and validated once, up front, in
+    # _main() — no need to reload it here.
     render_info = project.GetCurrentRenderFormatAndCodec()
     render_format = render_info.get('format', '').lower()  
     debug_print(f"Current render format: {render_format}")  
@@ -1100,20 +1219,41 @@ def get_filenames(markers, all_markers):
     is_exr = render_format == 'exr'
     debug_print(f"is_exr: {is_exr}")
     
-    for counter, mark in enumerate(sorted(markers)):
-        clip_info = get_clip_at_marker(timeline, timeline.GetStartFrame() + mark)
+    if counter_by_mark is None:
+        counter_by_mark = {mark: i for i, mark in enumerate(sorted(markers))}
+
+    ordered_marks = []
+    raw_filenames = []
+
+    # Computed once for the whole batch instead of per marker — see the
+    # has_video_audio note on get_clip_at_marker().
+    has_video, has_audio, _video_tracks, _audio_tracks = analyze_timeline_tracks(timeline, 0)
+
+    for mark in sorted(markers):
+        counter = counter_by_mark.get(mark, 0)
+        clip_info = get_clip_at_marker(timeline, timeline.GetStartFrame() + mark, has_video_audio=(has_video, has_audio))
         if clip_info:
             clip_info['marker_frame'] = mark
             components = generate_naming_components(clip_info, counter, all_markers)
             
             filename = "_".join(filter(None, components.values()))
-            
-            
-            if is_exr:
-                filename = filename + "."
-                debug_print(f"EXR sequence detected, adding dot suffix. Filename: {filename}")
-            
-            filename_map[mark] = filename
+
+            ordered_marks.append(mark)
+            raw_filenames.append(filename)
+
+    # Guard against two markers generating the exact same filename (e.g. the
+    # same Marker Name with no Auto Number/version component) — left as-is,
+    # one render job would silently overwrite the other's output.
+    unique_filenames = dup_fix(raw_filenames)
+    if unique_filenames != raw_filenames:
+        update_status("Some generated filenames were duplicates — added numbered suffixes to keep them unique")
+
+    for mark, filename in zip(ordered_marks, unique_filenames):
+        if is_exr:
+            filename = filename + "."
+            debug_print(f"EXR sequence detected, adding dot suffix. Filename: {filename}")
+
+        filename_map[mark] = filename
             
     return filename_map
 
@@ -1145,11 +1285,9 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
     proj.SetCurrentTimeline(tl)
     print("Timeline set.")
 
-    print("Loading render preset...")
-    proj.LoadRenderPreset(itm["render_preset"].CurrentText)
-    print("Render preset loaded.")
+    # The render preset is already loaded and validated once, up front, in
+    # _main() — no need to reload it here.
 
-    
     has_video, has_audio, video_tracks, audio_tracks = analyze_timeline_tracks(tl, 0)
     
     if not (has_video or has_audio):
@@ -1161,42 +1299,67 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
 
     start_frame = tl.GetStartFrame()
     queued_clips = []
+    queued_clip_ids = set()  # (timeline_start, timeline_end, track) for O(1) dedup lookups below
     counter = 0
+    failed_markers = []  # frames where the render job could not be added, for the final summary
 
     initial_jobs = set(job['JobId'] for job in proj.GetRenderJobList() or [])
     folder_template = ""
 
     print(f"Processing {media_type} clips under markers...")
-    
-    for mark in sorted(markers):
-        marker_frame = start_frame + mark
-        marker_data = all_markers.get(mark, {})
-        marker_type = get_marker_type(marker_data)
-        
-        if marker_type == "duration":
-            # Handle duration markers - use the same logic as Duration Markers script
-            start_frame = tl.GetStartFrame()
+
+    selected_marker_mode = itm["marker_type"].CurrentText
+
+    if selected_marker_mode in ("Single → Next Marker", "Single → Next Same Color"):
+        # Range mode based on single markers:
+        # IN = marker frame, OUT = next marker - 1
+        # Last marker renders to end of timeline.
+        selected_color = itm["marker_color"].CurrentText.split(" (")[0]
+
+        if selected_marker_mode == "Single → Next Same Color" and selected_color != "All":
+            # End range on the next marker with the same selected color (any type)
+            all_marker_frames_sorted = sorted(
+                frame for frame, marker in all_markers.items()
+                if marker.get("color") == selected_color
+            )
+        else:
+            # End range on the next marker of any color/type
+            all_marker_frames_sorted = sorted(all_markers.keys())
+
+        for mark in sorted(markers):
+            marker_frame = start_frame + mark
+
+            next_mark = None
+            for f in all_marker_frames_sorted:
+                if f > mark:
+                    next_mark = f
+                    break
+
             in_point = start_frame + mark
-            out_point = start_frame + mark + marker_data['duration'] - 1
-            
-            # Validate frame range
+            if next_mark is not None:
+                out_point = start_frame + next_mark - 1
+            else:
+                out_point = tl.GetEndFrame()
+
             validated_in, validated_out = validate_frame_range(in_point, out_point, tl)
             if validated_in is None or validated_out is None:
-                print(f"Skipping duration marker {mark} due to invalid frame range")
+                failed_markers.append(marker_frame)
+                skip_msg = f"Skipped range marker at frame {marker_frame}: invalid frame range"
+                update_status(skip_msg)
+                print(skip_msg)
                 continue
-            
-            print(f"\nProcessing duration marker {mark}: {validated_in} - {validated_out} (duration: {marker_data['duration']})")
-            
+
+            print(f"\nProcessing range marker {mark}: {validated_in} - {validated_out}")
+
             filename = filenames.get(mark, "")
-            
-            # Create folder path based on filename and settings
+
             clip_info_for_folder = {
                 'marker_frame': mark,
                 'timeline_start': validated_in,
                 'timeline_end': validated_out
             }
             target_dir = create_render_folder_path(path, filename, clip_info_for_folder, all_markers)
-            
+
             render_settings = {
                 "MarkIn": validated_in,
                 "MarkOut": validated_out,
@@ -1208,76 +1371,150 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
 
             try:
                 proj.SetRenderSettings(render_settings)
-                proj.AddRenderJob()
+                if not proj.AddRenderJob():
+                    raise RuntimeError("AddRenderJob returned false")
 
-                clip_info = {
+                queued_clips.append({
                     'timeline_start': validated_in,
                     'timeline_end': validated_out,
                     'job_id': None,
                     'target_dir': target_dir,
                     'media_type': media_type,
                     'marker_frame': mark,
-                    'marker_type': 'duration'
-                }
-                queued_clips.append(clip_info)
+                    'marker_type': 'single_to_next'
+                })
 
-                update_status(f"Added render job for duration marker at frame {marker_frame}")
-                print(f"Added render job for duration marker at frame {marker_frame} to {target_dir}")
+                update_status(f"Added render job for range starting at frame {marker_frame}")
+                print(f"Added render job for range starting at frame {marker_frame} to {target_dir}")
             except Exception as e:
-                error_msg = f"Error adding render job: {str(e)}"
+                failed_markers.append(marker_frame)
+                error_msg = f"Skipped marker at frame {marker_frame}: {str(e)}"
                 update_status(error_msg)
                 print(error_msg)
-        else:
-            # Handle single markers (existing logic)
-            clip_info = get_clip_at_marker(tl, marker_frame)
 
-            if clip_info:
-                print(f"\nProcessing single marker {mark}:")        
-                
-                # Add marker_frame to clip_info
-                clip_info['marker_frame'] = mark
-                print(f"Added marker_frame to clip_info: {mark}")
+            counter += 1
 
-                clip_id = (clip_info['timeline_start'], clip_info['timeline_end'], clip_info['track'])
+    else:
+        for mark in sorted(markers):
+            marker_frame = start_frame + mark
+            marker_data = all_markers.get(mark, {})
+            marker_type = get_marker_type(marker_data)
 
-                if clip_id not in [(c['timeline_start'], c['timeline_end'], c['track']) for c in queued_clips]:
-                    filename = filenames.get(mark, "")
-                    
-                    # Create folder path based on filename and settings
-                    target_dir = create_render_folder_path(path, filename, clip_info, all_markers)
-                    
-                    render_settings = {
-                        "MarkIn": clip_info['timeline_start'],
-                        "MarkOut": clip_info['timeline_end'],
-                        "TargetDir": target_dir
+            if marker_type == "duration":
+                # Handle duration markers - use the same logic as Duration Markers script
+                in_point = start_frame + mark
+                out_point = start_frame + mark + marker_data['duration'] - 1
+
+                # Validate frame range
+                validated_in, validated_out = validate_frame_range(in_point, out_point, tl)
+                if validated_in is None or validated_out is None:
+                    failed_markers.append(marker_frame)
+                    skip_msg = f"Skipped duration marker at frame {marker_frame}: invalid frame range"
+                    update_status(skip_msg)
+                    print(skip_msg)
+                    continue
+
+                print(f"\nProcessing duration marker {mark}: {validated_in} - {validated_out} (duration: {marker_data['duration']})")
+
+                filename = filenames.get(mark, "")
+
+                # Create folder path based on filename and settings
+                clip_info_for_folder = {
+                    'marker_frame': mark,
+                    'timeline_start': validated_in,
+                    'timeline_end': validated_out
+                }
+                target_dir = create_render_folder_path(path, filename, clip_info_for_folder, all_markers)
+
+                render_settings = {
+                    "MarkIn": validated_in,
+                    "MarkOut": validated_out,
+                    "TargetDir": target_dir
+                }
+
+                if not itm["use_preset_naming"].Checked and filename:
+                    render_settings["CustomName"] = filename
+
+                try:
+                    proj.SetRenderSettings(render_settings)
+                    if not proj.AddRenderJob():
+                        raise RuntimeError("AddRenderJob returned false")
+
+                    clip_info = {
+                        'timeline_start': validated_in,
+                        'timeline_end': validated_out,
+                        'job_id': None,
+                        'target_dir': target_dir,
+                        'media_type': media_type,
+                        'marker_frame': mark,
+                        'marker_type': 'duration'
                     }
+                    queued_clips.append(clip_info)
 
-                    if not itm["use_preset_naming"].Checked and filename:
-                        render_settings["CustomName"] = filename
-
-                    try:
-                        proj.SetRenderSettings(render_settings)
-                        proj.AddRenderJob()
-
-                        clip_info.update({
-                            'job_id': None,
-                            'target_dir': target_dir,
-                            'media_type': media_type
-                        })
-                        queued_clips.append(clip_info)
-
-                        update_status(f"Added render job for {media_type} clip at frame {marker_frame}")
-                        print(f"Added render job for {media_type} clip at frame {marker_frame} to {target_dir}")
-                    except Exception as e:
-                        error_msg = f"Error adding render job: {str(e)}"
-                        update_status(error_msg)
-                        print(error_msg)
-                else:
-                    print("Clip already queued.")
+                    update_status(f"Added render job for duration marker at frame {marker_frame}")
+                    print(f"Added render job for duration marker at frame {marker_frame} to {target_dir}")
+                except Exception as e:
+                    failed_markers.append(marker_frame)
+                    error_msg = f"Skipped marker at frame {marker_frame}: {str(e)}"
+                    update_status(error_msg)
+                    print(error_msg)
             else:
-                print(f"No {media_type} clip found at marker frame {marker_frame}")
+                # Handle single markers (existing logic)
+                clip_info = get_clip_at_marker(tl, marker_frame, has_video_audio=(has_video, has_audio))
 
-        counter += 1
+                if clip_info:
+                    print(f"\nProcessing single marker {mark}:")
+
+                    # Add marker_frame to clip_info
+                    clip_info['marker_frame'] = mark
+                    print(f"Added marker_frame to clip_info: {mark}")
+
+                    clip_id = (clip_info['timeline_start'], clip_info['timeline_end'], clip_info['track'])
+
+                    if clip_id not in queued_clip_ids:
+                        filename = filenames.get(mark, "")
+
+                        # Create folder path based on filename and settings
+                        target_dir = create_render_folder_path(path, filename, clip_info, all_markers)
+
+                        render_settings = {
+                            "MarkIn": clip_info['timeline_start'],
+                            "MarkOut": clip_info['timeline_end'],
+                            "TargetDir": target_dir
+                        }
+
+                        if not itm["use_preset_naming"].Checked and filename:
+                            render_settings["CustomName"] = filename
+
+                        try:
+                            proj.SetRenderSettings(render_settings)
+                            if not proj.AddRenderJob():
+                                raise RuntimeError("AddRenderJob returned false")
+
+                            clip_info.update({
+                                'job_id': None,
+                                'target_dir': target_dir,
+                                'media_type': media_type
+                            })
+                            queued_clips.append(clip_info)
+                            queued_clip_ids.add(clip_id)
+
+                            update_status(f"Added render job for {media_type} clip at frame {marker_frame}")
+                            print(f"Added render job for {media_type} clip at frame {marker_frame} to {target_dir}")
+                        except Exception as e:
+                            failed_markers.append(marker_frame)
+                            error_msg = f"Skipped marker at frame {marker_frame}: {str(e)}"
+                            update_status(error_msg)
+                            print(error_msg)
+                    else:
+                        print("Clip already queued.")
+                else:
+                    failed_markers.append(marker_frame)
+                    skip_msg = f"Skipped marker at frame {marker_frame}: no {media_type} clip found"
+                    update_status(skip_msg)
+                    print(skip_msg)
+
+            counter += 1
 
     final_jobs = proj.GetRenderJobList() or []
     new_job_ids = set(job['JobId'] for job in final_jobs) - initial_jobs
@@ -1290,6 +1527,9 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                     clip_info['render_name'] = job['OutputFilename']
 
     status_message = f"Render queue setup complete. Total {media_type} clips queued: {len(queued_clips)}"
+    if failed_markers:
+        frames_str = ", ".join(str(f) for f in failed_markers)
+        status_message += f" — {len(failed_markers)} skipped (frames: {frames_str})"
     update_status(status_message)
     print(status_message)
 
@@ -1305,13 +1545,49 @@ def _main(ev):
     Args:
         ev: The event object triggering this function.
     """
-    projectManager = resolve.GetProjectManager()
-    project = projectManager.GetCurrentProject()
-    timeline = project.GetTimelineByIndex(tl_idx(project, itm["tl_preset"].CurrentText))
+    # This tool always works with the same project/timeline that were active
+    # in Resolve when it was launched (the "project"/"timeline" globals) —
+    # never re-fetched mid-session, so filenames/naming (get_filenames,
+    # get_component_value) and the actual render always agree on which
+    # timeline they mean.
+    if not timeline:
+        update_status("No timeline selected")
+        return
+
+    # Validate the render preset up front — if it can't be loaded, abort
+    # before touching markers/filenames rather than failing partway through
+    # rendering.
+    preset_name = itm["render_preset"].CurrentText
+    if not preset_name:
+        update_status("No render preset selected — pick one and try again")
+        return
+    if not project.LoadRenderPreset(preset_name):
+        update_status(f"Render preset \"{preset_name}\" could not be loaded — pick a valid preset and try again")
+        return
 
     markers, all_markers = get_markers(timeline)
+    if not markers:
+        # get_markers() already put a specific "no X Y markers found" message
+        # in the status bar.
+        return
+
+    # Auto Number should reflect each marker's position among ALL markers
+    # matching the current color/type filter — not just among whichever ones
+    # happen to be checked for this particular render — so it stays stable
+    # whether you render everything or just a checked subset.
+    counter_by_mark = {mark: i for i, mark in enumerate(sorted(markers))}
+
+    # If the user checked specific rows in the table, render only those
+    # (that still match the current color/type filter); otherwise fall back
+    # to the previous behavior of processing every filtered marker.
+    if selected_frames:
+        markers = [f for f in markers if f in selected_frames]
+        if not markers:
+            update_status("Checked marker(s) don't match the current color/type filter — nothing to render")
+            return
+
     path = itm["export_path"].CurrentText
-    filename_map = get_filenames(markers, all_markers)  
+    filename_map = get_filenames(markers, all_markers, counter_by_mark)  
     export_stills(project, timeline, markers, all_markers, path, filename_map)
 
 ################################################################################################
@@ -1536,14 +1812,18 @@ preview_cooldown = 0.5
 is_updating_table = False
 is_initializing = False
 
+# Relative frame ids (as used by AddMarker/DeleteMarkerAtFrame) of markers the
+# user has checked in the table, for restricting render/delete to a subset.
+selected_frames = set()
+
 def initialize_naming_settings():
     """
     Initializes the naming settings comboboxes with predefined options.
     """
     naming_sources = {
-        "component1_source": ["ProjectName", "TimelineName", "MarkerName", "MarkerNote", "Reel Name", "SourceName", "ClipName", "Custom"],
-        "component2_source": ["ProjectName", "TimelineName", "MarkerName", "MarkerNote", "Reel Name", "SourceName", "ClipName", "Custom"],
-        "component3_source": ["ProjectName", "TimelineName", "MarkerName", "MarkerNote", "Reel Name", "SourceName", "ClipName", "Custom"],
+        "component1_source": ["ProjectName", "TimelineName", "TimelineFPS", "TimelineResolution", "RenderFormat", "RenderCodec", "RenderFormatCodec", "MarkerName", "MarkerNote", "Reel Name", "SourceName", "ClipName", "Custom"],
+        "component2_source": ["ProjectName", "TimelineName", "TimelineFPS", "TimelineResolution", "RenderFormat", "RenderCodec", "RenderFormatCodec", "MarkerName", "MarkerNote", "Reel Name", "SourceName", "ClipName", "Custom"],
+        "component3_source": ["ProjectName", "TimelineName", "TimelineFPS", "TimelineResolution", "RenderFormat", "RenderCodec", "RenderFormatCodec", "MarkerName", "MarkerNote", "Reel Name", "SourceName", "ClipName", "Custom"],
         "shotID_source": ["Auto Number", "Reel Name", "SourceName", "ClipName", "MarkerName", "MarkerNote"],
         "task_source": ["comp", "anim", "roto", "match", "paint", "Custom"]
     }
@@ -1669,7 +1949,7 @@ def populate_markers_table(ev=None):
     Populates the markers table with markers from the current timeline.
     """
     table = itm["markers_table"]
-    table.SetHeaderLabels(["Timecode", "Color", "Marker Name", "Source Name", "Clip Name", "Note", "Reel Name"])
+    table.SetHeaderLabels(["", "Timecode", "Color", "Marker Name", "Source Name", "Clip Name", "Note", "Reel Name"])
     
     global is_updating_table
     debug_print(f"populate_markers_table called, event: {ev}, is_updating_table: {is_updating_table}")
@@ -1679,7 +1959,9 @@ def populate_markers_table(ev=None):
 
     try:
         is_updating_table = True
-        current_timeline = project.GetCurrentTimeline()
+        # Always the timeline this session is locked to (the "timeline"
+        # global) — never re-fetched, so this always agrees with Export.
+        current_timeline = timeline
         if not current_timeline:
             return
 
@@ -1710,10 +1992,12 @@ def populate_markers_table(ev=None):
 
         selected_color = itm["marker_color"].CurrentText.split(" (")[0]
         fps = float(current_timeline.GetSetting('timelineFrameRate'))
+        smpte.fps = fps  # keep the timecode converter in sync with the actual timeline
         start_frame = current_timeline.GetStartFrame()
 
         # Prepare data for the table
         table_items = []
+        selected_marker_mode = itm["marker_type"].CurrentText
 
         for frame, marker in sorted(markers.items()):
             if selected_color != "All" and marker.get("color", "") != selected_color:
@@ -1726,10 +2010,11 @@ def populate_markers_table(ev=None):
                 continue
 
             timeline_frame = start_frame + frame
-            clip_info = get_clip_at_marker(current_timeline, timeline_frame)
+            clip_info = get_clip_at_marker(current_timeline, timeline_frame, has_video_audio=(has_video, has_audio))
 
             # For duration markers, we don't need clip_info to be valid
-            if marker_type == "duration" or clip_info:
+            # For range modes, we also allow markers without clip_info
+            if marker_type == "duration" or selected_marker_mode in ("Single → Next Marker", "Single → Next Same Color") or clip_info:
                 source_name = ""
                 clip_name = ""
                 reel_name = ""
@@ -1760,8 +2045,8 @@ def populate_markers_table(ev=None):
                     except Exception as e:
                         print(f"Error getting Reel Name: {str(e)}")
                 else:
-                    # For duration markers without clip info, use marker info
-                    source_name = "Duration Range"
+                    # For duration/range markers without clip info, use marker info
+                    source_name = "Duration Range" if marker_type == "duration" else "Range Start"
                     clip_name = ""
                     reel_name = ""
 
@@ -1769,6 +2054,7 @@ def populate_markers_table(ev=None):
                 timecode = smpte.gettc(total_frames)
 
                 table_items.append({
+                    'frame': frame,  # relative frame id, as used by AddMarker/DeleteMarkerAtFrame
                     'timecode': timecode,
                     'color': marker.get("color", ""),
                     'name': marker.get("name", ""),
@@ -1782,15 +2068,26 @@ def populate_markers_table(ev=None):
         # Add items to the table
         for item_data in table_items:
             item = table.NewItem()
-            item.Text[0] = item_data['timecode']
-            item.Text[1] = item_data['color']
-            item.Text[2] = item_data['name']
-            item.Text[3] = item_data['source']
-            item.Text[4] = item_data['clip_name']
-            item.Text[5] = item_data['note']
-            item.Text[6] = item_data['reel_name']  # Add Reel Name to the table
+            # Checkbox column: lets the user pick specific markers for
+            # rendering (see _main) or for deletion (see delete_checked_markers).
+            item.Flags = {"ItemIsSelectable": True, "ItemIsEnabled": True, "ItemIsUserCheckable": True}
+            item.CheckState[0] = "Checked" if item_data['frame'] in selected_frames else "Unchecked"
+            item.SetData(0, "UserRole", str(item_data['frame']))
+            item.Text[1] = item_data['timecode']
+            item.Text[2] = item_data['color']
+            item.Text[3] = item_data['name']
+            item.Text[4] = item_data['source']
+            item.Text[5] = item_data['clip_name']
+            item.Text[6] = item_data['note']
+            item.Text[7] = item_data['reel_name']  # Add Reel Name to the table
             table.AddTopLevelItem(item)
-        table.SortByColumn(0, "AscendingOrder")    
+        table.SortByColumn(1, "AscendingOrder")
+
+        # Drop any remembered checked frames that no longer exist on the
+        # timeline (e.g. deleted from the Edit page) or are no longer shown
+        # under the current color/type filter, so the count stays accurate.
+        visible_frames = {item_data['frame'] for item_data in table_items}
+        selected_frames.intersection_update(visible_frames)
     except Exception as e:
         update_status(f"Error: {str(e)}")
         print(f"Error in populate_markers_table: {str(e)}")
@@ -1798,23 +2095,370 @@ def populate_markers_table(ev=None):
         is_updating_table = False
         debug_print("populate_markers_table finished")
 
-def on_marker_double_clicked(ev):
+# Table column indices (kept in one place since several handlers below need them)
+COL_CHECK = 0
+COL_TIMECODE = 1
+COL_COLOR = 2
+COL_NAME = 3
+COL_SOURCE = 4
+COL_CLIP = 5
+COL_NOTE = 6
+COL_REEL = 7
+
+
+################################################################################################
+# MARKER EDITING (rename / re-color / re-note / delete via the table)
+################################################################################################
+#
+# The Resolve API has no "update marker" call — the only way to change a
+# marker's color/name/note is to delete it and re-add it at the same frame
+# with the new values (duration and customData are carried over as-is).
+
+def _apply_marker_edit(tl, frame, marker, **overrides):
     """
-    Jumps to the marker position when a marker is double-clicked in the table.
+    Re-creates a marker at `frame` with one or more fields overridden.
 
     Args:
-        ev: The event object containing the clicked item.
+        tl: The timeline the marker belongs to.
+        frame (int): Relative frame id (the key from GetMarkers()).
+        marker (dict): The marker's current data, as returned by GetMarkers().
+        **overrides: Any of color/name/note to change.
+
+    Returns:
+        bool: True if the marker was successfully re-added.
+    """
+    color = overrides.get("color", marker.get("color", "Blue"))
+    name = overrides.get("name", marker.get("name", ""))
+    note = overrides.get("note", marker.get("note", ""))
+    duration = marker.get("duration", 1) or 1
+    custom_data = marker.get("customData", "")
+
+    if not tl.DeleteMarkerAtFrame(frame):
+        update_status(f"Failed to update marker at frame {frame}")
+        return False
+
+    if not tl.AddMarker(frame, color, name, note, duration, custom_data):
+        update_status(f"Failed to re-add marker at frame {frame} after edit")
+        # Try to restore the original marker so we don't lose it entirely
+        tl.AddMarker(frame, marker.get("color", "Blue"), marker.get("name", ""),
+                     marker.get("note", ""), duration, custom_data)
+        return False
+
+    return True
+
+
+# --- Small reusable modal dialogs (built once, reused on every call) --------
+
+_dialog_cache = {}
+
+
+def _get_text_dialog():
+    """Lazily builds (once) the small modal dialog used to edit Name/Note."""
+    if "text" not in _dialog_cache:
+        dlg = disp.AddWindow(
+            {
+                "ID": "MTR_TextEditDialog",
+                "WindowTitle": "Edit",
+                "Geometry": [300, 300, 420, 120],
+                "WindowFlags": {"Window": True, "WindowStaysOnTopHint": True},
+            },
+            ui.VGroup({"Spacing": 8}, [
+                ui.Label({"ID": "text_edit_label", "Text": ""}),
+                ui.LineEdit({"ID": "text_edit_value"}),
+                ui.HGroup({"Spacing": 6}, [
+                    ui.Button({"ID": "text_edit_ok", "Text": "OK"}),
+                    ui.Button({"ID": "text_edit_cancel", "Text": "Cancel"}),
+                ]),
+            ])
+        )
+        _dialog_cache["text"] = dlg
+        _dialog_cache["text_itm"] = dlg.GetItems()
+    return _dialog_cache["text"], _dialog_cache["text_itm"]
+
+
+def _prompt_text(title, label, initial_text=""):
+    """Shows the text-edit dialog and returns the new text, or None if cancelled."""
+    dlg, ditm = _get_text_dialog()
+    dlg.WindowTitle = title
+    ditm["text_edit_label"].Text = label
+    ditm["text_edit_value"].Text = initial_text
+
+    result = {"value": None}
+
+    def _accept(ev):
+        result["value"] = ditm["text_edit_value"].Text
+        disp.ExitLoop()
+
+    def _reject(ev):
+        result["value"] = None
+        disp.ExitLoop()
+
+    dlg.On.text_edit_ok.Clicked = _accept
+    dlg.On.text_edit_cancel.Clicked = _reject
+    dlg.On.MTR_TextEditDialog.Close = _reject
+
+    dlg.Show()
+    disp.RunLoop()
+    dlg.Hide()
+    return result["value"]
+
+
+def _get_color_dialog():
+    """Lazily builds (once) the small modal dialog used to edit the marker Color."""
+    if "color" not in _dialog_cache:
+        dlg = disp.AddWindow(
+            {
+                "ID": "MTR_ColorEditDialog",
+                "WindowTitle": "Edit Marker Color",
+                "Geometry": [300, 300, 320, 110],
+                "WindowFlags": {"Window": True, "WindowStaysOnTopHint": True},
+            },
+            ui.VGroup({"Spacing": 8}, [
+                ui.Label({"Text": "New marker color:"}),
+                ui.ComboBox({"ID": "color_edit_value"}),
+                ui.HGroup({"Spacing": 6}, [
+                    ui.Button({"ID": "color_edit_ok", "Text": "OK"}),
+                    ui.Button({"ID": "color_edit_cancel", "Text": "Cancel"}),
+                ]),
+            ])
+        )
+        _dialog_cache["color"] = dlg
+        _dialog_cache["color_itm"] = dlg.GetItems()
+        # "Items" set at creation time isn't reliably picked up by this UI
+        # framework (same reason marker_type/render_preset etc. are populated
+        # via AddItems() after the fact elsewhere in this script) — populate
+        # explicitly instead.
+        _dialog_cache["color_itm"]["color_edit_value"].AddItems(color_lst[1:])  # skip "All"
+    return _dialog_cache["color"], _dialog_cache["color_itm"]
+
+
+def _prompt_color(current_color):
+    """Shows the color-edit dialog and returns the chosen color, or None if cancelled."""
+    dlg, ditm = _get_color_dialog()
+    if current_color in color_lst[1:]:
+        ditm["color_edit_value"].CurrentText = current_color
+
+    result = {"value": None}
+
+    def _accept(ev):
+        result["value"] = ditm["color_edit_value"].CurrentText
+        disp.ExitLoop()
+
+    def _reject(ev):
+        result["value"] = None
+        disp.ExitLoop()
+
+    dlg.On.color_edit_ok.Clicked = _accept
+    dlg.On.color_edit_cancel.Clicked = _reject
+    dlg.On.MTR_ColorEditDialog.Close = _reject
+
+    dlg.Show()
+    disp.RunLoop()
+    dlg.Hide()
+    return result["value"]
+
+
+def _get_confirm_dialog():
+    """Lazily builds (once) a generic Yes/No confirmation dialog."""
+    if "confirm" not in _dialog_cache:
+        dlg = disp.AddWindow(
+            {
+                "ID": "MTR_ConfirmDialog",
+                "WindowTitle": "Confirm",
+                "Geometry": [300, 300, 380, 120],
+                "WindowFlags": {"Window": True, "WindowStaysOnTopHint": True},
+            },
+            ui.VGroup({"Spacing": 10}, [
+                ui.Label({"ID": "confirm_label", "Text": "", "WordWrap": True}),
+                ui.HGroup({"Spacing": 6}, [
+                    ui.Button({"ID": "confirm_yes", "Text": "Yes"}),
+                    ui.Button({"ID": "confirm_no", "Text": "No"}),
+                ]),
+            ])
+        )
+        _dialog_cache["confirm"] = dlg
+        _dialog_cache["confirm_itm"] = dlg.GetItems()
+    return _dialog_cache["confirm"], _dialog_cache["confirm_itm"]
+
+
+def _confirm(title, message):
+    dlg, ditm = _get_confirm_dialog()
+    dlg.WindowTitle = title
+    ditm["confirm_label"].Text = message
+
+    result = {"value": False}
+
+    def _yes(ev):
+        result["value"] = True
+        disp.ExitLoop()
+
+    def _no(ev):
+        result["value"] = False
+        disp.ExitLoop()
+
+    dlg.On.confirm_yes.Clicked = _yes
+    dlg.On.confirm_no.Clicked = _no
+    dlg.On.MTR_ConfirmDialog.Close = _no
+
+    dlg.Show()
+    disp.RunLoop()
+    dlg.Hide()
+    return result["value"]
+
+
+def refresh_marker_color_filter():
+    """
+    Rebuilds the "Marker Color" filter dropdown from the timeline's current
+    markers (colors + counts), keeping the current selection if that color
+    still exists. Needed after any edit/delete that can change which colors
+    are in use or how many markers of each color there are — the dropdown
+    is otherwise only built once at startup.
+    """
+    current_timeline = timeline
+    previous_color = itm["marker_color"].CurrentText.split(" (")[0]
+    used_colors_with_counts = get_used_marker_colors(current_timeline)
+
+    itm["marker_color"].Clear()
+    itm["marker_color"].AddItems(used_colors_with_counts)
+
+    for entry in used_colors_with_counts:
+        if entry.split(" (")[0] == previous_color:
+            itm["marker_color"].CurrentText = entry
+            break
+    else:
+        itm["marker_color"].CurrentText = used_colors_with_counts[0]
+
+
+def on_marker_double_clicked(ev):
+    """
+    Double-click behavior in the markers table:
+    - Timecode column: jumps the playhead to that timecode (original behavior).
+    - Color / Marker Name / Note columns: opens a small dialog to edit the
+      marker in place (the timeline marker is deleted and re-added with the
+      new value, since Resolve has no direct "update marker" call).
     """
     try:
-        timecode = ev["item"].Text[0]
-        timeline = project.GetCurrentTimeline()
-        if timeline:
-            timeline.SetCurrentTimecode(timecode)
-            print(f"Moved playhead to timecode {timecode}")
+        item = ev["item"]
+        column = ev.get("column", COL_TIMECODE)
+
+        if column == COL_TIMECODE:
+            timecode = item.Text[COL_TIMECODE]
+            current_timeline = timeline
+            if current_timeline:
+                current_timeline.SetCurrentTimecode(timecode)
+                print(f"Moved playhead to timecode {timecode}")
+            return
+
+        if column not in (COL_COLOR, COL_NAME, COL_NOTE):
+            return
+
+        frame_data = item.GetData(0, "UserRole")
+        if not frame_data:
+            return
+        frame = int(frame_data)
+
+        current_timeline = timeline
+        if not current_timeline:
+            update_status("No timeline")
+            return
+
+        markers = current_timeline.GetMarkers()
+        marker = markers.get(frame)
+        if marker is None:
+            update_status("That marker no longer exists — refreshing the list")
+            populate_markers_table()
+            return
+
+        if column == COL_COLOR:
+            new_value = _prompt_color(marker.get("color", "Blue"))
+            if new_value is None or new_value == marker.get("color", ""):
+                return
+            if _apply_marker_edit(current_timeline, frame, marker, color=new_value):
+                update_status(f"Marker color changed to {new_value}")
+                refresh_marker_color_filter()
+
+        elif column == COL_NAME:
+            new_value = _prompt_text("Edit Marker Name", "Marker name:", marker.get("name", ""))
+            if new_value is None or new_value == marker.get("name", ""):
+                return
+            if _apply_marker_edit(current_timeline, frame, marker, name=new_value):
+                update_status(f"Marker renamed to \"{new_value}\"")
+
+        elif column == COL_NOTE:
+            new_value = _prompt_text("Edit Marker Note", "Note:", marker.get("note", ""))
+            if new_value is None or new_value == marker.get("note", ""):
+                return
+            if _apply_marker_edit(current_timeline, frame, marker, note=new_value):
+                update_status("Marker note updated")
+
+        populate_markers_table()
+
     except Exception as e:
+        update_status(f"Error editing marker: {str(e)}")
         print(f"Error in double click handler: {str(e)}")
         import traceback
         traceback.print_exc()
+
+
+def on_marker_item_changed(ev):
+    """
+    Tracks checkbox toggles in the markers table (column 0) so a subset of
+    markers can be chosen for rendering (see _main) or deletion (see
+    delete_checked_markers), without rebuilding the whole table — which would
+    wipe out every other row's check state.
+    """
+    global is_updating_table
+    if is_updating_table:
+        return
+    item = ev.get("item")
+    column = ev.get("column")
+    if item is None or column != COL_CHECK:
+        return
+    try:
+        frame_data = item.GetData(0, "UserRole")
+        if not frame_data:
+            return
+        frame = int(frame_data)
+        if item.CheckState[COL_CHECK] == "Checked":
+            selected_frames.add(frame)
+        else:
+            selected_frames.discard(frame)
+        if selected_frames:
+            update_status(f"{len(selected_frames)} marker(s) checked")
+    except Exception as e:
+        update_status(f"Error updating checkbox: {str(e)}")
+        print(f"Error in checkbox handler: {str(e)}")
+
+
+def delete_checked_markers(ev):
+    """Deletes every marker currently checked in the table, after confirmation."""
+    current_timeline = timeline
+    if not current_timeline:
+        update_status("No timeline")
+        return
+    if not selected_frames:
+        update_status("No markers checked — check a box in the table first")
+        return
+
+    count = len(selected_frames)
+    if not _confirm("Delete Markers", f"Delete {count} checked marker(s) from the timeline? This cannot be undone."):
+        return
+
+    deleted = 0
+    for frame in sorted(selected_frames):
+        if current_timeline.DeleteMarkerAtFrame(frame):
+            deleted += 1
+    selected_frames.clear()
+    update_status(f"Deleted {deleted} of {count} checked marker(s)")
+    refresh_marker_color_filter()
+    populate_markers_table()
+
+
+def clear_marker_selection(ev):
+    """Unchecks every marker without deleting anything."""
+    selected_frames.clear()
+    update_status("Marker checks cleared")
+    populate_markers_table()
 
 ################################################################################################
 # FILENAME MANAGEMENT
@@ -1908,21 +2552,28 @@ try:
     used_colors_with_counts = get_used_marker_colors(timeline)
     itm['marker_color'].AddItems(used_colors_with_counts)
     itm["render_preset"].AddItems(preset_lst(project))
-    itm["tl_preset"].AddItems([tl_lst(project)])
+    current_tl_name = get_session_timeline_name()
+    itm["tl_preset_label"].Text = current_tl_name or "— none —"
     # Load saved render paths
     itm["export_path"].AddItems(load_render_paths())
     
     # Populate video tracks
-    video_track_count = timeline.GetTrackCount("video")
+    video_track_count = timeline.GetTrackCount("video") if timeline else 0
     video_track_options = ["Default (Topmost)"] + [f"Video Track {i+1}" for i in range(video_track_count)]
     itm["video_track"].AddItems(video_track_options)
     
     # Initialize marker type combobox
-    itm["marker_type"].AddItems(["Single", "Duration"])
+    itm["marker_type"].AddItems(["Single", "Duration", "Single → Next Marker", "Single → Next Same Color"])
     itm["marker_type"].CurrentText = "Single"
 
-    # Populate markers table
-    populate_markers_table()
+    if not timeline:
+        # No timeline in the project (e.g. brand new/empty project) — let the
+        # user see the UI, just keep it inert until a timeline exists.
+        update_status("No timeline found in this project. Open or create a timeline, then reopen this tool.")
+        itm["Export"].Enabled = False
+    else:
+        # Populate markers table
+        populate_markers_table()
 finally:
     is_initializing = False
 
@@ -1937,6 +2588,9 @@ window.On.Export.Clicked = _main
 window.On.export_location.Clicked = _file_browser
 window.On.MTRWin.Close = _close
 window.On["markers_table"].ItemDoubleClicked = on_marker_double_clicked
+window.On["markers_table"].ItemChanged = on_marker_item_changed
+window.On.delete_markers_btn.Clicked = delete_checked_markers
+window.On.clear_selection_btn.Clicked = clear_marker_selection
 window.On.use_preset_naming.Clicked = toggle_naming_settings
 # Button handlers
 window.On.save_preset.Clicked = save_naming_preset
