@@ -1110,6 +1110,68 @@ def get_clip_at_marker(timeline, marker_frame, has_video_audio=None):
                 
     return None
 
+def get_clip_in_range(timeline, range_in, range_out, has_video_audio=None):
+    """
+    Finds the clip that best represents a marker RANGE (Duration / range modes).
+
+    First tries the clip under the range's first frame (same as single markers).
+    If there is none there (e.g. the range starts on a Solid Color, title,
+    Fusion comp or a transition), looks for the media clip with the largest
+    overlap with [range_in, range_out], honoring the Video Track selection.
+    Returns the same dict shape as get_clip_at_marker(), or None.
+    """
+    clip_info = get_clip_at_marker(timeline, range_in, has_video_audio=has_video_audio)
+    if clip_info:
+        return clip_info
+
+    if has_video_audio is not None:
+        has_video, has_audio = has_video_audio
+    else:
+        has_video, has_audio, _v, _a = analyze_timeline_tracks(timeline, range_in)
+
+    if has_video:
+        track_type = "video"
+        count = timeline.GetTrackCount("video")
+        selected_track = itm["video_track"].CurrentText
+        if selected_track != "Default (Topmost)":
+            try:
+                track_indices = [int(selected_track.split()[-1]) - 1]
+            except ValueError:
+                track_indices = []
+        else:
+            track_indices = list(range(count - 1, -1, -1))
+    elif has_audio:
+        track_type = "audio"
+        track_indices = list(range(timeline.GetTrackCount("audio")))
+    else:
+        return None
+
+    best, best_overlap = None, 0
+    for track_index in track_indices:
+        for clip in timeline.GetItemListInTrack(track_type, track_index + 1) or []:
+            media_pool_item = clip.GetMediaPoolItem()
+            if not media_pool_item:
+                continue
+            start = clip.GetStart()
+            end = start + clip.GetDuration() - 1
+            overlap = min(end, range_out) - max(start, range_in) + 1
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = {
+                    'clip': clip,
+                    'timeline_start': start,
+                    'timeline_end': end,
+                    'clip_in': clip.GetLeftOffset(),
+                    'clip_out': clip.GetLeftOffset() + clip.GetDuration() - 1,
+                    'duration': clip.GetDuration(),
+                    'track': track_index + 1,
+                    'track_type': track_type,
+                    'media_pool_item': media_pool_item
+                }
+        if best and track_type == "video":
+            break  # topmost track with an overlapping media clip wins
+    return best
+
 ################################################################################################
 # RENDER AND EXPORT
 ################################################################################################
@@ -1229,17 +1291,34 @@ def get_filenames(markers, all_markers, counter_by_mark=None):
     # has_video_audio note on get_clip_at_marker().
     has_video, has_audio, _video_tracks, _audio_tracks = analyze_timeline_tracks(timeline, 0)
 
+    start_frame = timeline.GetStartFrame()
     for mark in sorted(markers):
         counter = counter_by_mark.get(mark, 0)
-        clip_info = get_clip_at_marker(timeline, timeline.GetStartFrame() + mark, has_video_audio=(has_video, has_audio))
-        if clip_info:
-            clip_info['marker_frame'] = mark
-            components = generate_naming_components(clip_info, counter, all_markers)
-            
-            filename = "_".join(filter(None, components.values()))
+        marker_data = all_markers.get(mark, {})
+        if get_marker_type(marker_data) == "duration":
+            # Duration markers: look for a clip anywhere inside the marker range,
+            # not only on its first frame (which is often a transition/title/solid).
+            range_in = start_frame + mark
+            range_out = range_in + int(marker_data.get('duration', 1)) - 1
+            clip_info = get_clip_in_range(timeline, range_in, range_out, has_video_audio=(has_video, has_audio))
+        else:
+            clip_info = get_clip_at_marker(timeline, start_frame + mark, has_video_audio=(has_video, has_audio))
 
-            ordered_marks.append(mark)
-            raw_filenames.append(filename)
+        # Previously a marker without a media clip under it got NO filename,
+        # so the job silently fell back to whatever name was left in Deliver
+        # (timeline name or a stale custom name from an earlier job).
+        # Marker/Project/Timeline-based components don't need a clip at all.
+        if not clip_info:
+            clip_info = {}
+        clip_info['marker_frame'] = mark
+        components = generate_naming_components(clip_info, counter, all_markers)
+
+        filename = "_".join(filter(None, components.values()))
+        if not filename:
+            filename = sanitize_filename(marker_data.get('name') or f"Marker_{mark}")
+
+        ordered_marks.append(mark)
+        raw_filenames.append(filename)
 
     # Guard against two markers generating the exact same filename (e.g. the
     # same Marker Name with no Auto Number/version component) — left as-is,
@@ -1366,7 +1445,9 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                 "TargetDir": target_dir
             }
 
-            if not itm["use_preset_naming"].Checked and filename:
+            if not itm["use_preset_naming"].Checked:
+                # never leave CustomName unset here, or Resolve reuses a stale name
+                filename = filename or sanitize_filename(all_markers.get(mark, {}).get('name') or f"Marker_{mark}")
                 render_settings["CustomName"] = filename
 
             try:
@@ -1432,7 +1513,9 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                     "TargetDir": target_dir
                 }
 
-                if not itm["use_preset_naming"].Checked and filename:
+                if not itm["use_preset_naming"].Checked:
+                    # never leave CustomName unset here, or Resolve reuses a stale name
+                    filename = filename or sanitize_filename(all_markers.get(mark, {}).get('name') or f"Marker_{mark}")
                     render_settings["CustomName"] = filename
 
                 try:
@@ -1483,7 +1566,9 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                             "TargetDir": target_dir
                         }
 
-                        if not itm["use_preset_naming"].Checked and filename:
+                        if not itm["use_preset_naming"].Checked:
+                            # never leave CustomName unset here, or Resolve reuses a stale name
+                            filename = filename or sanitize_filename(all_markers.get(mark, {}).get('name') or f"Marker_{mark}")
                             render_settings["CustomName"] = filename
 
                         try:

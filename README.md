@@ -50,6 +50,17 @@ Run from **Workspace → Scripts** in Resolve (or from the Fusion page Scripts m
 
 Double-click a row's Timecode to jump the playhead there. The status line at the bottom reports what happened, including any markers that were skipped and why.
 
+## Changelog
+
+### 4.1
+- **Fix: custom filenames ignored for Duration markers.** Filenames were only generated when a media clip sat exactly on the marker's first frame. If a Duration marker started on a title, Fusion composition, Solid Color or transition, the job got no `CustomName` and Resolve fell back to whatever name was left in the Deliver page (timeline name or a stale name from a previous job). Now:
+  - Duration markers look for a media clip anywhere inside the marker range (largest overlap, topmost track / selected Video Track) — only needed for Source/Clip/Reel name components.
+  - A marker is never skipped for naming just because no clip was found; Marker/Project/Timeline/Auto Number components don't need one.
+  - With custom naming enabled, `CustomName` is always set (falls back to the marker name), so stale Deliver names are never inherited.
+
+### 4.0
+- Marker modes Single → Next Marker / Single → Next Same Color, in-table marker editing, per-row checkboxes (render subset / delete), duplicate filename protection, up-front render preset validation, empty-project support.
+
 ## License
 
 MIT © PostFlows
